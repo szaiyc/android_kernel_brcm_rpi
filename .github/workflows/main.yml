@@ -1,0 +1,63 @@
+name: Build RPi Android 14 Kernel with KSU & eBPF
+
+on:
+  workflow_dispatch: # 允许手动点击按钮触发
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Maximize Build Space
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 8192
+        swap-size-mb: 4096
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+
+    - name: Install Dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y git bc bison flex libssl-dev make libc6-dev libncurses-dev dwarves curl
+        mkdir -p ~/.bin
+        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+        chmod a+x ~/.bin/repo
+        echo "$HOME/.bin" >> $GITHUB_PATH
+
+    - name: Sync Source
+      run: |
+        mkdir work
+        cd work
+        repo init -u https://github.com/raspberry-vanilla/android_kernel_manifest -b android-14.0
+        repo sync -j4
+
+    - name: Patch KSU and eBPF
+      run: |
+        cd work/common
+        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+        
+        # Patch flask.h
+        sed -i '/ccflags-y += -I$(srctree)\/drivers\/kernelsu/a ccflags-y += -I$(srctree)/security/selinux\nccflags-y += -I$(srctree)/security/selinux/include' drivers/kernelsu/Makefile
+        
+        # Add configs
+        cat <<EOT >> arch/arm64/configs/bcm2711_defconfig
+        CONFIG_KSU=y
+        CONFIG_BPF=y
+        CONFIG_BPF_SYSCALL=y
+        CONFIG_BPF_JIT=y
+        CONFIG_DEBUG_INFO_BTF=y
+        CONFIG_DEBUG_INFO=y
+        CONFIG_KPROBES=y
+        EOT
+
+    - name: Build
+      run: |
+        cd work
+        BUILD_CONFIG=common/build.config.rpi4 build/build.sh
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: rpi-kernel-image
+        path: work/out/**/dist/Image
