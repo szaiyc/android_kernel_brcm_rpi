@@ -1,70 +1,79 @@
-name: Build RPi Android 14 Kernel (KSU + eBPF)
+name: Build RPi Android 14 Kernel (Extreme Cleanup)
 
 on:
-  workflow_dispatch: # 允许手动点击 "Run workflow" 按钮触发
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     
     steps:
-    - name: Free Disk Space (Maximize Build Space)
-      uses: easimon/maximize-build-space@master
-      with:
-        root-reserve-mb: 8192
-        swap-size-mb: 4096
-        remove-dotnet: 'true'
-        remove-android: 'true'
-        remove-haskell: 'true'
-        remove-codeql: 'true'
+    - name: 🗑️ Extreme Disk Cleanup (关键步骤)
+      run: |
+        echo ">>> Disk space before cleanup:"
+        df -h
+        
+        echo ">>> Removing pre-installed software..."
+        # 删除 Docker 镜像
+        sudo docker image prune -a -f
+        # 删除 Android SDK (极大)
+        sudo rm -rf /usr/local/lib/android
+        # 删除 .NET
+        sudo rm -rf /usr/share/dotnet
+        # 删除 Haskell
+        sudo rm -rf /opt/ghc
+        # 删除 CodeQL 分析工具
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        # 删除其他缓存
+        sudo rm -rf /usr/share/swift
+        sudo rm -rf /usr/local/.ghcup
+        
+        echo ">>> Disk space after cleanup:"
+        df -h
+        # 此时你应该拥有大约 50GB-60GB 的可用空间
 
-    - name: Install Dependencies
+    - name: 📦 Install Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y git bc bison flex libssl-dev make libc6-dev libncurses-dev dwarves cpio unzip rsync curl
         
-        # 安装 repo 工具
         mkdir -p ~/.bin
         curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
         chmod a+x ~/.bin/repo
         echo "$HOME/.bin" >> $GITHUB_PATH
         
-        # 配置 git (repo 需要)
         git config --global user.email "action@github.com"
         git config --global user.name "GitHub Action"
 
-    - name: Sync Source Code (via Manifest)
+    - name: ⬇️ Sync Source Code (Shallow)
       run: |
         mkdir work
         cd work
-        # 使用你提供的 Manifest
-        # repo init -u https://github.com/raspberry-vanilla/android_kernel_manifest -b android-14.0 --depth=1
-        repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1-lts --depth=1
-        curl -o .repo/local_manifests/manifest_brcm_rpi.xml -L https://raw.githubusercontent.com/raspberry-vanilla/android_kernel_manifest/android-14.0/manifest_brcm_rpi.xml --create-dirs
-        repo sync -j$(nproc) --force-sync
+        # 使用 --depth=1 和 -c (只拉取当前分支) 来最小化下载体积
+        repo init -u https://github.com/raspberry-vanilla/android_kernel_manifest -b android-14.0 --depth=1 --no-tags
+        
+        # --no-clone-bundle --no-tags --optimized-fetch 进一步减少体积
+        repo sync -j$(nproc) --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune
 
-    - name: Patch KernelSU & Fix Errors
+    - name: 🛠️ Patch KernelSU & Fixes
       run: |
-        # 寻找内核源码目录 (通常是 common)
         cd work
+        # 自动定位内核目录
         if [ -d "common" ]; then cd common; else cd kernel; fi
         
         echo ">>> Integrating KernelSU..."
         curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
         
         echo ">>> Fixing flask.h error..."
-        # 修复 flask.h 报错
         sed -i '/ccflags-y += -I$(srctree)\/drivers\/kernelsu/a ccflags-y += -I$(srctree)/security/selinux\nccflags-y += -I$(srctree)/security/selinux/include' drivers/kernelsu/Makefile
         
-        echo ">>> Applying eBPF & BTF Configs..."
-        # 寻找配置文件
+        echo ">>> Applying eBPF Configs..."
         if [ -f "arch/arm64/configs/bcm2711_defconfig" ]; then
             CONFIG_FILE="arch/arm64/configs/bcm2711_defconfig"
         else
             CONFIG_FILE="arch/arm64/configs/rpi4_defconfig"
         fi
         
-        # 写入配置
         cat <<EOT >> $CONFIG_FILE
         CONFIG_KSU=y
         CONFIG_BPF=y
@@ -77,18 +86,20 @@ jobs:
         CONFIG_FTRACE=y
         EOT
 
-    - name: Build Kernel
+    - name: 🚀 Build Kernel
       run: |
         cd work
         echo ">>> Starting Build..."
         
-        # 自动判断构建方式 (build.sh 或 bazel)
+        # 优先使用 Manifest 指定的构建脚本
         if [ -f "build/build.sh" ]; then
             BUILD_CONFIG=common/build.config.rpi4 build/build.sh
         elif [ -f "tools/bazel" ]; then
+            # 如果是 Kleaf 构建系统，使用 bazel
             tools/bazel build --config=fast //common:rpi4
         else
-            # 最后的尝试：如果上面都不行，尝试直接用 make (不推荐，但作为兜底)
+            # 最后的保底手段：直接 Make
+            echo "WARNING: Standard build scripts not found, falling back to make..."
             cd common
             export ARCH=arm64
             export CROSS_COMPILE=aarch64-linux-gnu-
@@ -96,12 +107,12 @@ jobs:
             make Image -j$(nproc)
         fi
 
-    - name: Upload Image
+    - name: 📤 Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: kernel8-img
-        # 尝试匹配所有可能的输出路径
+        name: rpi-android14-kernel
         path: |
           work/out/**/dist/Image
           work/bazel-bin/**/Image
           work/common/arch/arm64/boot/Image
+          work/out/**/dist/*.ko
