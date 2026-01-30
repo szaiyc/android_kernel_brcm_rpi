@@ -1,111 +1,107 @@
-#!/bin/bash
-set -e # Stop on error
+name: Build RPi Android 14 Kernel (KSU + eBPF)
 
-# ================= CONFIGURATION =================
-WORK_DIR=~/rpi_android14_build
-MANIFEST_URL="https://github.com/raspberry-vanilla/android_kernel_manifest"
-BRANCH="android-14.0"
-# =================================================
+on:
+  workflow_dispatch: # 允许手动点击 "Run workflow" 按钮触发
 
-echo ">>> [1/7] Installing Dependencies..."
-sudo apt update
-sudo apt install -y git bc bison flex libssl-dev make libc6-dev \
-                    libncurses-dev pkg-config cross-build-essential-arm64 \
-                    dwarves cpio unzip rsync curl
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - name: Free Disk Space (Maximize Build Space)
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 8192
+        swap-size-mb: 4096
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
 
-# Install repo tool
-mkdir -p ~/.bin
-curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
-chmod a+x ~/.bin/repo
-export PATH=~/.bin:$PATH
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git bc bison flex libssl-dev make libc6-dev libncurses-dev dwarves cpio unzip rsync curl
+        
+        # 安装 repo 工具
+        mkdir -p ~/.bin
+        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+        chmod a+x ~/.bin/repo
+        echo "$HOME/.bin" >> $GITHUB_PATH
+        
+        # 配置 git (repo 需要)
+        git config --global user.email "action@github.com"
+        git config --global user.name "GitHub Action"
 
-# Configure Git (Required by Repo)
-git config --global user.email "you@example.com"
-git config --global user.name "Your Name"
+    - name: Sync Source Code (via Manifest)
+      run: |
+        mkdir work
+        cd work
+        # 使用你提供的 Manifest
+        # repo init -u https://github.com/raspberry-vanilla/android_kernel_manifest -b android-14.0 --depth=1
+        repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1-lts --depth=1
+        curl -o .repo/local_manifests/manifest_brcm_rpi.xml -L https://raw.githubusercontent.com/raspberry-vanilla/android_kernel_manifest/android-14.0/manifest_brcm_rpi.xml --create-dirs
+        repo sync -j$(nproc) --force-sync
 
-echo ">>> [2/7] Initializing Work Directory..."
-mkdir -p $WORK_DIR
-cd $WORK_DIR
+    - name: Patch KernelSU & Fix Errors
+      run: |
+        # 寻找内核源码目录 (通常是 common)
+        cd work
+        if [ -d "common" ]; then cd common; else cd kernel; fi
+        
+        echo ">>> Integrating KernelSU..."
+        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+        
+        echo ">>> Fixing flask.h error..."
+        # 修复 flask.h 报错
+        sed -i '/ccflags-y += -I$(srctree)\/drivers\/kernelsu/a ccflags-y += -I$(srctree)/security/selinux\nccflags-y += -I$(srctree)/security/selinux/include' drivers/kernelsu/Makefile
+        
+        echo ">>> Applying eBPF & BTF Configs..."
+        # 寻找配置文件
+        if [ -f "arch/arm64/configs/bcm2711_defconfig" ]; then
+            CONFIG_FILE="arch/arm64/configs/bcm2711_defconfig"
+        else
+            CONFIG_FILE="arch/arm64/configs/rpi4_defconfig"
+        fi
+        
+        # 写入配置
+        cat <<EOT >> $CONFIG_FILE
+        CONFIG_KSU=y
+        CONFIG_BPF=y
+        CONFIG_BPF_SYSCALL=y
+        CONFIG_BPF_JIT=y
+        CONFIG_DEBUG_INFO_BTF=y
+        CONFIG_DEBUG_INFO=y
+        CONFIG_KPROBES=y
+        CONFIG_PERF_EVENTS=y
+        CONFIG_FTRACE=y
+        EOT
 
-# Initialize Repo
-# Using depth=1 to speed up download
-repo init -u $MANIFEST_URL -b $BRANCH --depth=1
-echo ">>> [3/7] Syncing Source Code..."
-repo sync -j$(nproc) --force-sync
+    - name: Build Kernel
+      run: |
+        cd work
+        echo ">>> Starting Build..."
+        
+        # 自动判断构建方式 (build.sh 或 bazel)
+        if [ -f "build/build.sh" ]; then
+            BUILD_CONFIG=common/build.config.rpi4 build/build.sh
+        elif [ -f "tools/bazel" ]; then
+            tools/bazel build --config=fast //common:rpi4
+        else
+            # 最后的尝试：如果上面都不行，尝试直接用 make (不推荐，但作为兜底)
+            cd common
+            export ARCH=arm64
+            export CROSS_COMPILE=aarch64-linux-gnu-
+            make bcm2711_defconfig
+            make Image -j$(nproc)
+        fi
 
-echo ">>> [4/7] Integrating KernelSU..."
-# The 'common' folder is usually where the kernel source lives in this manifest
-if [ -d "common" ]; then
-    cd common
-elif [ -d "kernel" ]; then
-    cd kernel
-else
-    echo "Error: Cannot find kernel source directory (common/ or kernel/)"
-    exit 1
-fi
-
-# Download KernelSU setup script
-curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
-
-# === Fix: Apply flask.h Patch ===
-echo ">>> [4.1/7] Fixing flask.h build error..."
-KSU_MAKEFILE="drivers/kernelsu/Makefile"
-if ! grep -q "security/selinux/include" "$KSU_MAKEFILE"; then
-    sed -i '/ccflags-y += -I$(srctree)\/drivers\/kernelsu/a ccflags-y += -I$(srctree)/security/selinux\nccflags-y += -I$(srctree)/security/selinux/include' "$KSU_MAKEFILE"
-    echo "✔ flask.h patch applied"
-else
-    echo "✔ flask.h patch already exists"
-fi
-
-echo ">>> [5/7] Configuring eBPF and BTF..."
-# Determine config file location (try rpi4 specific first, then bcm2711)
-if [ -f "arch/arm64/configs/bcm2711_defconfig" ]; then
-    DEFCONFIG_PATH="arch/arm64/configs/bcm2711_defconfig"
-elif [ -f "arch/arm64/configs/rpi4_defconfig" ]; then
-    DEFCONFIG_PATH="arch/arm64/configs/rpi4_defconfig"
-else
-    echo "Error: Could not find defconfig file."
-    exit 1
-fi
-
-echo "Modifying config: $DEFCONFIG_PATH"
-cat <<EOT >> $DEFCONFIG_PATH
-
-# ================= AI Added Configs =================
-CONFIG_KSU=y
-CONFIG_BPF=y
-CONFIG_BPF_SYSCALL=y
-CONFIG_BPF_JIT=y
-CONFIG_DEBUG_INFO_BTF=y
-CONFIG_DEBUG_INFO=y
-CONFIG_KPROBES=y
-CONFIG_PERF_EVENTS=y
-CONFIG_FTRACE=y
-# ====================================================
-EOT
-
-# Go back to ROOT of the repo workspace to run the build command
-cd .. 
-
-echo ">>> [6/7] Starting Build..."
-
-# FIX: The build script is located inside build/ directory in root
-# and we must specify the config relative to ROOT.
-
-if [ -f "build/build.sh" ]; then
-    # Standard GKI / Android Common Kernel build method
-    BUILD_CONFIG=common/build.config.rpi4 build/build.sh
-elif [ -f "tools/bazel" ]; then
-    # Bazel (Kleaf) build method - used by newer Android kernels
-    echo "Detected Bazel/Kleaf build system..."
-    tools/bazel build --config=fast //common:rpi4
-else
-    echo "Error: Could not find build.sh or tools/bazel. Checking directory structure..."
-    ls -F
-    exit 1
-fi
-
-echo "=========================================="
-echo ">>> [7/7] Build Complete!"
-echo "Check 'out/' or 'bazel-bin/' for your Image file."
-echo "=========================================="
+    - name: Upload Image
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel8-img
+        # 尝试匹配所有可能的输出路径
+        path: |
+          work/out/**/dist/Image
+          work/bazel-bin/**/Image
+          work/common/arch/arm64/boot/Image
