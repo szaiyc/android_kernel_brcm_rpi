@@ -50,8 +50,9 @@ jobs:
         mkdir work
         cd work
         # 使用 --depth=1 和 -c (只拉取当前分支) 来最小化下载体积
-        repo init -u https://github.com/raspberry-vanilla/android_kernel_manifest -b android-14.0 --depth=1 --no-tags
-        
+        # repo init -u https://github.com/raspberry-vanilla/android_kernel_manifest -b android-14.0 --depth=1 --no-tags
+        repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1-lts --depth=1 --no-tags
+        curl -o .repo/local_manifests/manifest_brcm_rpi.xml -L https://raw.githubusercontent.com/raspberry-vanilla/android_kernel_manifest/android-14.0/manifest_brcm_rpi.xml --create-dirs
         # --no-clone-bundle --no-tags --optimized-fetch 进一步减少体积
         repo sync -j$(nproc) --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune
 
